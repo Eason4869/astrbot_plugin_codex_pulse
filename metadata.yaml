@@ -1,6 +1,6 @@
-name: astrbot_plugin_codex_reset
-display_name: Codex 重置通知
-desc: 图片卡片查询与群通知，区分额度直接重置、重置卡发放和重置预告，支持黑白名单与渲染失败文字回退。
-version: v1.3.0
-author: Glmg
-repo: https://github.com/Koishi0425/astrbot_plugin_codex_reset
+name: astrbot_plugin_codex_pulse
+display_name: Codex Pulse｜重置脉搏
+desc: 精美卡片追踪 Codex 直接重置、重置卡发放与预告，支持分类群通知、管理员测试卡片和文字回退。
+version: v1.0.0
+author: Eason4869
+repo: https://github.com/Eason4869/astrbot_plugin_codex_pulse

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from data.plugins.astrbot_plugin_codex_reset.forecast import Forecast
-from data.plugins.astrbot_plugin_codex_reset.presentation import build_card
+from data.plugins.astrbot_plugin_codex_pulse.forecast import Forecast
+from data.plugins.astrbot_plugin_codex_pulse.presentation import build_card
 
 TZ = timezone(timedelta(hours=8))
 

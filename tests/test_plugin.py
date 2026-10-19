@@ -5,9 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from data.plugins.astrbot_plugin_codex_reset import forecast as forecast_module
-from data.plugins.astrbot_plugin_codex_reset.forecast import Forecast
-from data.plugins.astrbot_plugin_codex_reset.main import CodexResetPlugin
+from data.plugins.astrbot_plugin_codex_pulse import forecast as forecast_module
+from data.plugins.astrbot_plugin_codex_pulse.forecast import Forecast
+from data.plugins.astrbot_plugin_codex_pulse.main import CodexPulsePlugin
 
 NOW = datetime(2026, 9, 22, 7, tzinfo=timezone.utc)
 GROUP = "bot:GroupMessage:123"
@@ -60,7 +60,7 @@ def plugin():
         send_message=AsyncMock(return_value=True),
         platform_manager=SimpleNamespace(platform_insts=[]),
     )
-    instance = CodexResetPlugin(context, {"group_ids": [GROUP]})
+    instance = CodexPulsePlugin(context, {"group_ids": [GROUP]})
     instance.known_groups = {GROUP}
     instance.delivery_cursors = {GROUP: "2026-09-12T08:09:17+00:00"}
     instance.put_kv_data = AsyncMock()
@@ -348,7 +348,7 @@ async def test_explicit_text_mode_skips_renderer(plugin, payload):
 async def test_banked_notice_does_not_advance_direct_reset_receipt(plugin, payload):
     from datetime import timedelta
 
-    from data.plugins.astrbot_plugin_codex_reset.banked import BankedSnapshot
+    from data.plugins.astrbot_plugin_codex_pulse.banked import BankedSnapshot
 
     plugin.html_render = AsyncMock(return_value="https://example.com/ticket.png")
     payload["latest_alert"] = None
@@ -407,8 +407,8 @@ async def test_reload_preserves_banked_receipt(plugin):
 
 @pytest.mark.asyncio
 async def test_ticket_notifies_when_forecast_is_unavailable(plugin, monkeypatch):
-    from data.plugins.astrbot_plugin_codex_reset import main as main_module
-    from data.plugins.astrbot_plugin_codex_reset.banked import BankedSnapshot
+    from data.plugins.astrbot_plugin_codex_pulse import main as main_module
+    from data.plugins.astrbot_plugin_codex_pulse.banked import BankedSnapshot
 
     now = datetime.now(timezone.utc)
     banked = BankedSnapshot.from_payload(
@@ -448,7 +448,7 @@ async def test_ticket_notifies_when_forecast_is_unavailable(plugin, monkeypatch)
 @pytest.mark.asyncio
 async def test_source_link_switch_controls_both_site_and_tibo(plugin, payload, enabled):
     from astrbot.api.message_components import Image, Plain
-    from data.plugins.astrbot_plugin_codex_reset.presentation import build_card
+    from data.plugins.astrbot_plugin_codex_pulse.presentation import build_card
 
     plugin.config["send_source_links"] = enabled
     plugin.html_render = AsyncMock(return_value="https://example.com/card.png")
@@ -467,7 +467,7 @@ async def test_source_link_switch_controls_both_site_and_tibo(plugin, payload, e
 
 @pytest.mark.asyncio
 async def test_link_switch_does_not_strip_fallback_sources(plugin, payload):
-    from data.plugins.astrbot_plugin_codex_reset.presentation import build_card
+    from data.plugins.astrbot_plugin_codex_pulse.presentation import build_card
 
     plugin.config["send_source_links"] = False
     f = Forecast.from_payload(payload)
@@ -475,3 +475,163 @@ async def test_link_switch_does_not_strip_fallback_sources(plugin, payload):
         build_card(f, timezone.utc), f.render(timezone.utc)
     )
     assert "https://codex-reset.com/" in message.chain[0].text
+
+
+@pytest.mark.parametrize(
+    "key,action", [("notify_direct_reset", "direct"), ("notify_reset_watch", "watch")]
+)
+@pytest.mark.asyncio
+async def test_independent_notification_switches_skip_and_baseline(
+    plugin, payload, key, action
+):
+    plugin.config[key] = False
+    if action == "direct":
+        payload["last_reset_at"] = "2026-09-22T06:30:00Z"
+        payload["latest_alert"] = None
+    f = Forecast.from_payload(payload)
+    await plugin.notify_groups(f)
+    plugin.context.send_message.assert_not_awaited()
+    plugin.config[key] = True
+    await plugin.notify_groups(f)
+    plugin.context.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disabling_watch_does_not_disable_direct_reset(plugin, payload):
+    plugin.config["notify_reset_watch"] = False
+    payload["last_reset_at"] = "2026-09-22T06:30:00Z"
+    await plugin.notify_groups(Forecast.from_payload(payload))
+    plugin.context.send_message.assert_awaited_once()
+    assert "直接重置" in plugin.context.send_message.await_args.args[1].chain[0].text
+
+
+@pytest.mark.asyncio
+async def test_admin_test_command_returns_three_demo_cards_without_network_or_receipts(
+    plugin,
+):
+    from astrbot.api.event import MessageEventResult
+    from astrbot.api.message_components import Image
+
+    plugin.html_render = AsyncMock(return_value="https://example.com/demo.png")
+    plugin.fetch_forecast = AsyncMock()
+    plugin.fetch_banked = AsyncMock()
+    plugin.config.update(
+        enabled=False,
+        notification_output="text",
+        query_output="text",
+        notify_direct_reset=False,
+        notify_reset_watch=False,
+        notify_banked_reset=False,
+    )
+    before = deepcopy(
+        (plugin.delivery_cursors, plugin.alert_cursors, plugin.banked_cursors)
+    )
+    event = SimpleNamespace(
+        get_group_id=lambda: "123",
+        is_admin=lambda: True,
+        chain_result=lambda chain: MessageEventResult(chain),
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event, "测试")]
+    assert len(results) == 3
+    assert all(
+        any(isinstance(item, Image) for item in result.chain) for result in results
+    )
+    assert all(
+        call.args[1]["card"]["test"] for call in plugin.html_render.await_args_list
+    )
+    assert all(
+        "示例数据" in call.args[1]["card"]["test_banner"]
+        for call in plugin.html_render.await_args_list
+    )
+    assert before == (
+        plugin.delivery_cursors,
+        plugin.alert_cursors,
+        plugin.banked_cursors,
+    )
+    plugin.fetch_forecast.assert_not_awaited()
+    plugin.fetch_banked.assert_not_awaited()
+    plugin.put_kv_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_test_cards(plugin):
+    from astrbot.api.event import MessageEventResult
+
+    event = SimpleNamespace(
+        get_group_id=lambda: "123",
+        is_admin=lambda: False,
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event, "测试")]
+    assert "仅 AstrBot 管理员" in results[0].chain[0].text
+    plugin.html_render.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_banked_switch_suppresses_only_tickets_and_does_not_replay(plugin):
+    from data.plugins.astrbot_plugin_codex_pulse.banked import BankedSnapshot
+
+    plugin.config["notify_banked_reset"] = False
+    now = datetime.now(timezone.utc)
+    plugin.banked_cursors[GROUP] = {
+        "id": "old",
+        "state": "available",
+        "at": (now - timedelta(days=1)).isoformat(),
+    }
+    banked = BankedSnapshot.from_payload(
+        {
+            "updated_at": now.isoformat(),
+            "events": [
+                {
+                    "id": "new",
+                    "group": "credits",
+                    "type": "credits",
+                    "banked_state": "available",
+                    "announced_at": (now - timedelta(minutes=1)).isoformat(),
+                }
+            ],
+        }
+    )
+    await plugin.notify_groups(None, banked)
+    plugin.context.send_message.assert_not_awaited()
+    assert plugin.banked_cursors[GROUP]["id"] == "new"
+    plugin.config["notify_banked_reset"] = True
+    await plugin.notify_groups(None, banked)
+    plugin.context.send_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "kind", ["direct", "ticket", "watch", "直接重置", "发卡", "预告"]
+)
+@pytest.mark.asyncio
+async def test_admin_can_test_one_type_with_text_fallback(plugin, kind):
+    from astrbot.api.event import MessageEventResult
+
+    event = SimpleNamespace(
+        get_group_id=lambda: "123",
+        is_admin=lambda: True,
+        chain_result=lambda chain: MessageEventResult(chain),
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event, "test", kind)]
+    assert len(results) == 1
+    assert "示例数据，不是真实重置通知" in results[0].chain[0].text
+    assert results[0].use_t2i_ is False
+
+
+@pytest.mark.asyncio
+async def test_test_command_requires_group_and_rejects_unknown_type(plugin):
+    from astrbot.api.event import MessageEventResult
+
+    event = SimpleNamespace(
+        get_group_id=lambda: "",
+        is_admin=lambda: True,
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event, "测试")]
+    assert "群聊" in results[0].chain[0].text
+    event.get_group_id = lambda: "123"
+    results = [result async for result in plugin.codex(event, "测试", "invalid")]
+    assert "用法" in results[0].chain[0].text
+    plugin.html_render.assert_not_awaited()

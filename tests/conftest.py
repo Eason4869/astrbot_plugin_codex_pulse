@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 for name, path in (
     ("data", ROOT.parent.parent),
     ("data.plugins", ROOT.parent),
-    ("data.plugins.astrbot_plugin_codex_reset", ROOT),
+    ("data.plugins.astrbot_plugin_codex_pulse", ROOT),
 ):
     if name not in sys.modules:
         module = ModuleType(name)

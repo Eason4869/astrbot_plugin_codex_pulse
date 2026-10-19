@@ -5,7 +5,8 @@
 .row-label{font-size:19px}.row-value{font-size:23px}.group{font-size:21px}.time-label{font-size:20px}.date{font-size:23px}.note,.notification .note{font-size:23px}.notification .note{min-height:106px;display:flex;align-items:center}
 </style></head>
 <body><main class="{{ card.accent }} {% if card.notification %}notification{% endif %}">
-<div class="brand"><!-- OPENAI_LOGO --><div><div class="brand-name">Codex</div><div class="descriptor">{% if card.icon == 'ticket' %}重置卡发放{% elif card.accent == 'gold' and not card.warning %}公共重置预告{% else %}公共重置追踪{% endif %}</div></div><span class="community">社区通知</span></div>
+{% if card.test %}<div class="warning">{{ card.test_banner }}</div>{% endif %}
+<div class="brand"><!-- OPENAI_LOGO --><div><div class="brand-name">Codex Pulse</div><div class="descriptor">{% if card.icon == 'ticket' %}重置卡发放{% elif card.accent == 'gold' and not card.warning %}公共重置预告{% else %}公共重置追踪{% endif %}</div></div><span class="community">社区通知</span></div>
 <div class="hero"><div class="badge">{{ card.badge }}</div><h1>{{ card.title }}</h1><p class="subtitle">{{ card.subtitle }}</p>
 <div class="seal"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">{% if card.icon == 'check' %}<circle cx="24" cy="24" r="19"/><path d="m15 24 6 6 13-14"/>{% elif card.icon == 'ticket' %}<path d="M6 13h36v8a4 4 0 0 0 0 8v7H6v-7a4 4 0 0 0 0-8z"/><path d="M31 14v4m0 5v3m0 5v4"/>{% else %}<circle cx="24" cy="24" r="19"/><path d="M24 12v13l9 5"/>{% endif %}</svg></div></div>
 {% if card.warning %}<div class="warning">{{ card.warning }}</div>{% endif %}

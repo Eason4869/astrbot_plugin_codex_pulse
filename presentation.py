@@ -268,3 +268,61 @@ def banked_text(snapshot: BankedSnapshot, tz: timezone) -> str:
         + (f"公告：{event.url}\n" if event.url else "")
         + f"来源：{SOURCE}"
     )
+
+
+def build_test_cards(tz: timezone, kind: str = "all") -> list[dict]:
+    """Build unmistakable synthetic samples without fetching or storing live data."""
+    if kind not in {"all", "direct", "ticket", "watch"}:
+        raise ValueError("Unknown test card type")
+    now = datetime.now(timezone.utc)
+    base = {
+        "updated_at": now.isoformat(),
+        "last_reset_at": (now - timedelta(minutes=5)).isoformat(),
+        "probabilities": {"rounded_24h": None, "rounded_48h": None},
+    }
+    direct = Forecast.from_payload(base)
+    watch = Forecast.from_payload(
+        {
+            **base,
+            "last_reset_at": (now - timedelta(days=2)).isoformat(),
+            "alert_event_id": "demo:watch",
+            "latest_alert": {
+                "kind": "watch",
+                "state": "active",
+                "score": 93,
+                "source_at": (now - timedelta(minutes=1)).isoformat(),
+                "window": {"end_at": (now + timedelta(hours=4)).isoformat()},
+            },
+        }
+    )
+    ticket = BankedSnapshot.from_payload(
+        {
+            "updated_at": now.isoformat(),
+            "events": [
+                {
+                    "id": "demo:ticket",
+                    "group": "credits",
+                    "type": "credits",
+                    "banked_state": "available",
+                    "announced_at": (now - timedelta(minutes=3)).isoformat(),
+                }
+            ],
+        }
+    )
+    factories = {
+        "direct": lambda: build_card(direct, tz, "last", notification=True),
+        "ticket": lambda: build_card(
+            None, tz, notification=True, banked=ticket, banked_notice=True
+        ),
+        "watch": lambda: build_card(watch, tz, "watch", notification=True),
+    }
+    cards = []
+    for selected in factories if kind == "all" else (kind,):
+        card = factories[selected]()
+        card.update(
+            test=True,
+            test_banner="管理员测试 · 示例数据，不是真实重置通知",
+            badge="测试示例",
+        )
+        cards.append(card)
+    return cards

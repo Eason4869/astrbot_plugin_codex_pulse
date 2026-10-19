@@ -13,10 +13,10 @@ from astrbot.core.platform.message_session import MessageSession
 from .banked import BankedSnapshot
 from .card_renderer import CardRenderer
 from .forecast import Forecast, parse_time
-from .presentation import banked_text, build_card
+from .presentation import banked_text, build_card, build_test_cards
 
 
-class CodexResetPlugin(Star):
+class CodexPulsePlugin(Star):
     """Track public Codex resets and notify groups selected by one shared policy."""
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -143,7 +143,7 @@ class CodexResetPlugin(Star):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers={
-                "User-Agent": "astrbot_plugin_codex_reset/1.3.0 (+https://github.com/Koishi0425/astrbot_plugin_codex_reset)",
+                "User-Agent": "astrbot_plugin_codex_pulse/1.0.0 (+https://github.com/Eason4869/astrbot_plugin_codex_pulse)",
                 "Accept": "application/json",
             },
             trust_env=True,
@@ -402,12 +402,14 @@ class CodexResetPlugin(Star):
             self.banked_cache_time = monotonic()
             return snapshot
 
-    async def card_message(self, card: dict, text: str) -> MessageChain:
+    async def card_message(
+        self, card: dict, text: str, *, force_image: bool = False
+    ) -> MessageChain:
         """Build one image + source message, or the original text on render failure."""
         mode = "notification_output" if card["notification"] else "query_output"
         image = (
             await self.cards.render(card, self.html_render)
-            if self.config.get(mode, "image") == "image"
+            if force_image or self.config.get(mode, "image") == "image"
             else None
         )
         if image:
@@ -438,10 +440,14 @@ class CodexResetPlugin(Star):
         watch = forecast.active_watch() if forecast else None
         # Rendering is potentially slow; keep it outside the subscription/state lock.
         messages = {}
-        if reset_at and any(
-            cursor and parse_time(cursor) < forecast.last_reset
-            for origin, cursor in self.delivery_cursors.items()
-            if self.is_group_enabled(origin)
+        if (
+            self.config.get("notify_direct_reset", True)
+            and reset_at
+            and any(
+                cursor and parse_time(cursor) < forecast.last_reset
+                for origin, cursor in self.delivery_cursors.items()
+                if self.is_group_enabled(origin)
+            )
         ):
             text = (
                 "【Codex 额度重置通知】\n"
@@ -451,13 +457,18 @@ class CodexResetPlugin(Star):
             messages["last"] = await self.card_message(
                 build_card(forecast, self.tz, "last", notification=True), text
             )
-        if watch and any(
-            self.alert_cursors.get(origin) != watch[0]
-            and (
-                cursor is None or parse_time(cursor) < parse_time(watch[1]["source_at"])
+        if (
+            self.config.get("notify_reset_watch", True)
+            and watch
+            and any(
+                self.alert_cursors.get(origin) != watch[0]
+                and (
+                    cursor is None
+                    or parse_time(cursor) < parse_time(watch[1]["source_at"])
+                )
+                for origin, cursor in self.delivery_cursors.items()
+                if self.is_group_enabled(origin)
             )
-            for origin, cursor in self.delivery_cursors.items()
-            if self.is_group_enabled(origin)
         ):
             text = (
                 "【Codex 重置预告】\n"
@@ -468,11 +479,15 @@ class CodexResetPlugin(Star):
                 build_card(forecast, self.tz, "watch", notification=True), text
             )
         ticket = banked.notifiable() if banked else None
-        if ticket and any(
-            origin in self.banked_cursors
-            and ticket.follows(self.banked_cursors[origin])
-            for origin in self.delivery_cursors
-            if self.is_group_enabled(origin)
+        if (
+            self.config.get("notify_banked_reset", True)
+            and ticket
+            and any(
+                origin in self.banked_cursors
+                and ticket.follows(self.banked_cursors[origin])
+                for origin in self.delivery_cursors
+                if self.is_group_enabled(origin)
+            )
         ):
             messages["banked"] = await self.card_message(
                 build_card(
@@ -493,7 +508,13 @@ class CodexResetPlugin(Star):
                 if not self.is_group_enabled(origin):
                     continue
                 pending = []
-                if reset_at and cursor is None:
+                if reset_at and (
+                    cursor is None
+                    or (
+                        not self.config.get("notify_direct_reset", True)
+                        and parse_time(cursor) < forecast.last_reset
+                    )
+                ):
                     # Past resets establish a baseline; live promises remain useful.
                     self.delivery_cursors[origin] = reset_at
                     try:
@@ -511,7 +532,16 @@ class CodexResetPlugin(Star):
                     )
                 if watch:
                     watch_id, alert = watch
-                    if self.alert_cursors.get(origin) != watch_id and (
+                    if not self.config.get("notify_reset_watch", True):
+                        if self.alert_cursors.get(origin) != watch_id:
+                            previous = self.alert_cursors.get(origin)
+                            self.alert_cursors[origin] = watch_id
+                            try:
+                                await self.save_delivery_state()
+                            except Exception:
+                                self.alert_cursors[origin] = previous
+                                raise
+                    elif self.alert_cursors.get(origin) != watch_id and (
                         cursor is None
                         or parse_time(cursor) < parse_time(alert["source_at"])
                     ):
@@ -541,7 +571,20 @@ class CodexResetPlugin(Star):
                             self.banked_cursors.pop(origin, None)
                             raise
                     elif (
-                        ticket
+                        not self.config.get("notify_banked_reset", True)
+                        and banked.latest
+                        and banked.latest.follows(self.banked_cursors[origin])
+                    ):
+                        previous = self.banked_cursors[origin]
+                        self.banked_cursors[origin] = banked.latest.receipt
+                        try:
+                            await self.save_delivery_state()
+                        except Exception:
+                            self.banked_cursors[origin] = previous
+                            raise
+                    elif (
+                        self.config.get("notify_banked_reset", True)
+                        and ticket
                         and banked.notifiable()
                         and ticket.follows(self.banked_cursors[origin])
                     ):
@@ -601,12 +644,15 @@ class CodexResetPlugin(Star):
             await asyncio.sleep(self.interval)
 
     @filter.command("codex", alias={"codex重置"})
-    async def codex(self, event: AstrMessageEvent, action: str = "状态"):
+    async def codex(
+        self, event: AstrMessageEvent, action: str = "状态", kind: str = "全部"
+    ):
         """Query public resets or edit the shared group notification policy.
 
         Args:
             event: Incoming AstrBot message event.
             action: Query or subscription action, in Chinese or English.
+            kind: Optional sample card type for the administrator test command.
 
         Yields:
             An image card with source links, or text if rendering is unavailable.
@@ -618,7 +664,38 @@ class CodexResetPlugin(Star):
             "订阅": "subscribe",
             "取消": "unsubscribe",
             "帮助": "help",
+            "测试": "test",
         }.get(action.lower(), action.lower())
+        if action == "test":
+            if not event.is_admin():
+                yield event.plain_result("仅 AstrBot 管理员可以发送测试卡片。")
+                return
+            if not event.get_group_id():
+                yield event.plain_result("请在需要验证收图的群聊中使用 /codex 测试。")
+                return
+            selected = {
+                "全部": "all",
+                "直接重置": "direct",
+                "重置": "direct",
+                "reset": "direct",
+                "发卡": "ticket",
+                "重置卡": "ticket",
+                "banked": "ticket",
+                "预告": "watch",
+            }.get(kind.lower(), kind.lower())
+            if selected not in {"all", "direct", "ticket", "watch"}:
+                yield event.plain_result(
+                    "用法：/codex 测试 [全部 / 直接重置 / 发卡 / 预告]"
+                )
+                return
+            for card in build_test_cards(self.tz, selected):
+                text = (
+                    f"【{card['test_banner']}】\n{card['title']}\n"
+                    f"{card['date']} {card['primary']} {card['zone']}\n{card['note']}"
+                )
+                message = await self.card_message(card, text, force_image=True)
+                yield event.chain_result(message.chain).use_t2i(False)
+            return
         if action in {"subscribe", "unsubscribe"}:
             if not event.get_group_id():
                 yield event.plain_result("请在需要接收通知的群聊中使用此指令。")
@@ -679,6 +756,7 @@ class CodexResetPlugin(Star):
                 "/codex 预测 — 当前预告、时间窗口与 24/48 小时概率\n"
                 "/codex 订阅 — 在当前名单模式下启用本群通知（管理员）\n"
                 "/codex 取消 — 在当前名单模式下关闭本群通知（管理员）\n"
+                "/codex 测试 [全部/直接重置/发卡/预告] — 示例卡片（管理员）\n"
                 "时间默认 UTC+08:00；跟踪公共全局重置。"
             )
             return

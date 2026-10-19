@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from data.plugins.astrbot_plugin_codex_reset.banked import BankedSnapshot
+from data.plugins.astrbot_plugin_codex_pulse.banked import BankedSnapshot
 
 
 def snapshot(events):

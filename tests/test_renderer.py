@@ -2,8 +2,8 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
-from data.plugins.astrbot_plugin_codex_reset import card_renderer as module
-from data.plugins.astrbot_plugin_codex_reset.card_renderer import CardRenderer
+from data.plugins.astrbot_plugin_codex_pulse import card_renderer as module
+from data.plugins.astrbot_plugin_codex_pulse.card_renderer import CardRenderer
 
 
 @pytest.mark.asyncio

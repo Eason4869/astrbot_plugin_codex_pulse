@@ -1,4 +1,22 @@
 {
+  "notify_direct_reset": {
+    "description": "通知：额度直接重置",
+    "type": "bool",
+    "default": true,
+    "hint": "控制已确认的公共额度直接重置通知。关闭不影响查询；关闭期间同步事件基线，重新开启不补发旧事件。受自动通知总开关和群名单约束。"
+  },
+  "notify_banked_reset": {
+    "description": "通知：重置卡发放",
+    "type": "bool",
+    "default": true,
+    "hint": "控制重置卡发放公告、发放中和已观测可用通知，与额度直接重置分别去重。关闭期间同步基线，重新开启不补发旧事件。"
+  },
+  "notify_reset_watch": {
+    "description": "通知：重置预告",
+    "type": "bool",
+    "default": true,
+    "hint": "控制网站标记为有效强信号的重置预告。关闭不影响预测查询；关闭期间同步预告基线，重新开启不补发已见预告。"
+  },
   "send_source_links": {
     "description": "随卡片发送源链接",
     "type": "bool",

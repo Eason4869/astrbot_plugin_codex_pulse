@@ -5,13 +5,15 @@ from datetime import timedelta, timezone
 from time import monotonic
 
 import aiohttp
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.message_session import MessageSession
 
+from .banked import BankedSnapshot
+from .card_renderer import CardRenderer
 from .forecast import Forecast, parse_time
+from .presentation import banked_text, build_card
 
 
 class CodexResetPlugin(Star):
@@ -53,6 +55,15 @@ class CodexResetPlugin(Star):
         self.known_groups: set[str] = set()
         self.delivery_cursors: dict[str, str | None] = {}
         self.alert_cursors: dict[str, str | None] = {}
+        self.banked_cursors: dict[str, dict] = {}
+        self.cached_banked: BankedSnapshot | None = None
+        self.banked_cache_time = 0.0
+        self.banked_retry_at = 0.0
+        self.banked_fetch_lock = asyncio.Lock()
+        self.cards = CardRenderer()
+        for key in ("query_output", "notification_output"):
+            if self.config.get(key, "image") not in {"image", "text"}:
+                raise ValueError(f"Invalid {key}")
         self.next_discovery = 0.0
         self.cached: Forecast | None = None
         self.cache_time = 0.0
@@ -75,13 +86,20 @@ class CodexResetPlugin(Star):
         if not isinstance(stored, dict):
             raise ValueError("Invalid stored Codex reset delivery state")
         stored.setdefault("alerts", {})
+        stored.setdefault("banked", {})
         if (
             not isinstance(stored.get("known_groups"), list)
             or not isinstance(stored.get("cursors"), dict)
             or not isinstance(stored.get("alerts"), dict)
+            or not isinstance(stored.get("banked"), dict)
         ):
             raise ValueError("Invalid stored Codex reset delivery state")
-        for origin in [*stored["known_groups"], *stored["cursors"], *stored["alerts"]]:
+        for origin in [
+            *stored["known_groups"],
+            *stored["cursors"],
+            *stored["alerts"],
+            *stored["banked"],
+        ]:
             if not isinstance(origin, str):
                 raise ValueError("Invalid stored group session")
             session = MessageSession.from_str(origin)
@@ -100,6 +118,17 @@ class CodexResetPlugin(Star):
         self.known_groups = set(stored["known_groups"]) | set(stored["cursors"])
         self.delivery_cursors = dict(stored["cursors"])
         self.alert_cursors = dict(stored["alerts"])
+        for receipt in stored["banked"].values():
+            if (
+                not isinstance(receipt, dict)
+                or not isinstance(receipt.get("id"), str)
+                or not isinstance(receipt.get("state"), str)
+                or receipt["state"]
+                not in {"announced", "arriving", "available", "unknown"}
+            ):
+                raise ValueError("Invalid banked reset receipt")
+            parse_time(receipt.get("at"))
+        self.banked_cursors = dict(stored["banked"])
         if migrating:
             # An explicit new policy takes precedence over legacy subscriptions.
             if (
@@ -114,7 +143,7 @@ class CodexResetPlugin(Star):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers={
-                "User-Agent": "astrbot_plugin_codex_reset/1.2.1 (+https://github.com/Koishi0425/astrbot_plugin_codex_reset)",
+                "User-Agent": "astrbot_plugin_codex_reset/1.3.0 (+https://github.com/Koishi0425/astrbot_plugin_codex_reset)",
                 "Accept": "application/json",
             },
             trust_env=True,
@@ -144,6 +173,7 @@ class CodexResetPlugin(Star):
                 "known_groups": sorted(self.known_groups),
                 "cursors": dict(self.delivery_cursors),
                 "alerts": dict(self.alert_cursors),
+                "banked": dict(self.banked_cursors),
             },
         )
 
@@ -319,16 +349,145 @@ class CodexResetPlugin(Star):
             self.last_error = ""
             return forecast
 
-    async def notify_groups(self, forecast: Forecast):
+    async def fetch_banked(self) -> BankedSnapshot | None:
+        """Read the independent ticket timeline; failures never block direct resets."""
+        async with self.banked_fetch_lock:
+            now = monotonic()
+            if now < self.banked_retry_at:
+                return self.cached_banked
+            if self.cached_banked and now - self.banked_cache_time < 60:
+                return self.cached_banked
+            if self.session is None:
+                return self.cached_banked
+            try:
+                async with self.session.get(
+                    "https://codex-reset.com/api/timeline",
+                    proxy=self.config.get("proxy") or None,
+                ) as response:
+                    if response.status == 403:
+                        async with self.session.get(
+                            "https://r.jina.ai/https://codex-reset.com/api/timeline",
+                            proxy=self.config.get("proxy") or None,
+                            headers={"Accept": "text/plain"},
+                        ) as fallback:
+                            fallback.raise_for_status()
+                            body = await fallback.text()
+                        _, separator, encoded = body.partition("Markdown Content:\n")
+                        if not separator:
+                            raise ValueError("Missing timeline JSON")
+                        data = json.loads(encoded.strip())
+                    else:
+                        if response.status == 429:
+                            try:
+                                delay = float(
+                                    response.headers.get("Retry-After", "120")
+                                )
+                            except ValueError:
+                                delay = 120
+                            self.banked_retry_at = monotonic() + max(
+                                120, min(delay, 3600)
+                            )
+                        response.raise_for_status()
+                        data = await response.json()
+                snapshot = BankedSnapshot.from_payload(data)
+                if not snapshot.is_fresh():
+                    raise ValueError("Stale ticket timeline")
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                self.banked_retry_at = max(self.banked_retry_at, monotonic() + 60)
+                logger.warning(
+                    "Codex ticket timeline unavailable; direct reset tracking continues."
+                )
+                return self.cached_banked
+            self.cached_banked = snapshot
+            self.banked_cache_time = monotonic()
+            return snapshot
+
+    async def card_message(self, card: dict, text: str) -> MessageChain:
+        """Build one image + source message, or the original text on render failure."""
+        mode = "notification_output" if card["notification"] else "query_output"
+        image = (
+            await self.cards.render(card, self.html_render)
+            if self.config.get(mode, "image") == "image"
+            else None
+        )
+        if image:
+            message = MessageChain().url_image(image).use_t2i(False)
+            if self.config.get("send_source_links", True):
+                links = list(dict.fromkeys(card["links"]))
+                message.message("来源与公告：\n" + "\n".join(links))
+            return message
+        return MessageChain().message(text).use_t2i(False)
+
+    async def notify_groups(
+        self, forecast: Forecast | None, banked: BankedSnapshot | None = None
+    ):
         """Deliver reset confirmations and live promises with separate receipts.
 
         Args:
             forecast: Validated source data. Stale snapshots are never delivered.
         """
-        if not self.config.get("enabled", True) or not forecast.is_fresh():
+        if not self.config.get("enabled", True):
             return
-        reset_at = forecast.last_reset.isoformat() if forecast.last_reset else None
-        watch = forecast.active_watch()
+        if forecast and not forecast.is_fresh():
+            forecast = None
+        reset_at = (
+            forecast.last_reset.isoformat()
+            if forecast and forecast.last_reset
+            else None
+        )
+        watch = forecast.active_watch() if forecast else None
+        # Rendering is potentially slow; keep it outside the subscription/state lock.
+        messages = {}
+        if reset_at and any(
+            cursor and parse_time(cursor) < forecast.last_reset
+            for origin, cursor in self.delivery_cursors.items()
+            if self.is_group_enabled(origin)
+        ):
+            text = (
+                "【Codex 额度重置通知】\n"
+                + forecast.render(self.tz, "last")
+                + "\n这是额度直接重置，不是重置卡发放。请在自己的 Codex 中确认额度到账。"
+            )
+            messages["last"] = await self.card_message(
+                build_card(forecast, self.tz, "last", notification=True), text
+            )
+        if watch and any(
+            self.alert_cursors.get(origin) != watch[0]
+            and (
+                cursor is None or parse_time(cursor) < parse_time(watch[1]["source_at"])
+            )
+            for origin, cursor in self.delivery_cursors.items()
+            if self.is_group_enabled(origin)
+        ):
+            text = (
+                "【Codex 重置预告】\n"
+                + forecast.render(self.tz, "watch")
+                + "\n这是重置预告，网站尚未确认重置完成。"
+            )
+            messages["watch"] = await self.card_message(
+                build_card(forecast, self.tz, "watch", notification=True), text
+            )
+        ticket = banked.notifiable() if banked else None
+        if ticket and any(
+            origin in self.banked_cursors
+            and ticket.follows(self.banked_cursors[origin])
+            for origin in self.delivery_cursors
+            if self.is_group_enabled(origin)
+        ):
+            messages["banked"] = await self.card_message(
+                build_card(
+                    forecast,
+                    self.tz,
+                    notification=True,
+                    banked=banked,
+                    banked_notice=True,
+                ),
+                "【Codex 重置卡发放】\n" + banked_text(banked, self.tz),
+            )
+        if not self.config.get("enabled", True):
+            return
+        if forecast and not forecast.is_fresh():
+            reset_at, watch = None, None
         async with self.state_lock:
             for origin, cursor in list(self.delivery_cursors.items()):
                 if not self.is_group_enabled(origin):
@@ -347,9 +506,7 @@ class CodexResetPlugin(Star):
                         (
                             self.delivery_cursors,
                             reset_at,
-                            "【Codex 额度重置通知】\n"
-                            + forecast.render(self.tz, "last")
-                            + "\n请在自己的 Codex 中确认额度到账。",
+                            messages.get("last"),
                         )
                     )
                 if watch:
@@ -362,17 +519,45 @@ class CodexResetPlugin(Star):
                             (
                                 self.alert_cursors,
                                 watch_id,
-                                "【Codex 重置预告】\n"
-                                + forecast.render(self.tz, "watch")
-                                + "\n这是重置预告，网站尚未确认重置完成。",
+                                messages.get("watch")
+                                if forecast.active_watch()
+                                else None,
+                            )
+                        )
+                if banked and banked.is_fresh():
+                    if origin not in self.banked_cursors:
+                        self.banked_cursors[origin] = (
+                            banked.latest.receipt
+                            if banked.latest
+                            else {
+                                "id": "",
+                                "at": banked.updated_at.isoformat(),
+                                "state": "unknown",
+                            }
+                        )
+                        try:
+                            await self.save_delivery_state()
+                        except Exception:
+                            self.banked_cursors.pop(origin, None)
+                            raise
+                    elif (
+                        ticket
+                        and banked.notifiable()
+                        and ticket.follows(self.banked_cursors[origin])
+                    ):
+                        pending.append(
+                            (
+                                self.banked_cursors,
+                                ticket.receipt,
+                                messages.get("banked"),
                             )
                         )
                 for receipts, event_id, message in pending:
+                    if message is None:
+                        continue
                     try:
                         delivered = await asyncio.wait_for(
-                            self.context.send_message(
-                                origin, MessageChain().message(message)
-                            ),
+                            self.context.send_message(origin, message),
                             timeout=30,
                         )
                         if not delivered:
@@ -400,8 +585,15 @@ class CodexResetPlugin(Star):
             try:
                 await self.refresh_groups()
                 if self.delivery_cursors:
-                    forecast = await self.fetch_forecast()
-                    await self.notify_groups(forecast)
+                    try:
+                        forecast = await self.fetch_forecast()
+                    except RuntimeError:
+                        forecast = None
+                        logger.warning(
+                            "Codex forecast unavailable; ticket tracking continues independently."
+                        )
+                    banked = await self.fetch_banked()
+                    await self.notify_groups(forecast, banked)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -417,7 +609,7 @@ class CodexResetPlugin(Star):
             action: Query or subscription action, in Chinese or English.
 
         Yields:
-            A plain-text command response.
+            An image card with source links, or text if rendering is unavailable.
         """
         action = {
             "状态": "status",
@@ -500,6 +692,7 @@ class CodexResetPlugin(Star):
             forecast = self.cached
             warning = f"⚠ {exc}\n以下为旧缓存，预测可能已失效。\n"
         reply = warning + forecast.render(self.tz, action)
+        group_note = ""
         if action == "status" and event.get_group_id():
             origin = f"{event.get_platform_id()}:GroupMessage:{event.get_group_id()}"
             allowed = self.is_group_enabled(origin)
@@ -508,14 +701,30 @@ class CodexResetPlugin(Star):
                 if self.config.get("group_mode", "whitelist") == "whitelist"
                 else "黑名单"
             )
-            reply += (
-                "\n本群通知："
-                + ("已启用" if allowed else "已关闭")
-                + f"（{label}模式）"
+            group_note = (
+                "本群通知：" + ("已启用" if allowed else "已关闭") + f"（{label}模式）"
             )
             if not self.config.get("enabled", True):
-                reply += "\n自动通知总开关已关闭。"
-        yield event.plain_result(reply)
+                group_note += "\n自动通知总开关已关闭。"
+            reply += "\n" + group_note
+        banked = await self.fetch_banked()
+        if banked:
+            reply += "\n\n" + banked_text(banked, self.tz)
+        else:
+            reply += "\n重置卡记录暂不可用，未据此判断发放。"
+            group_note += (
+                "\n" if group_note else ""
+            ) + "重置卡记录暂不可用，未据此判断发放。"
+        card = build_card(
+            forecast,
+            self.tz,
+            action,
+            warning=warning,
+            group_note=group_note,
+            banked=banked,
+        )
+        message = await self.card_message(card, reply)
+        yield event.chain_result(message.chain).use_t2i(False)
 
     async def terminate(self):
         """Cancel polling before closing the shared HTTP session."""

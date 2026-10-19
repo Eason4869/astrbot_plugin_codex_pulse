@@ -1,4 +1,24 @@
 {
+  "send_source_links": {
+    "description": "随卡片发送源链接",
+    "type": "bool",
+    "default": true,
+    "hint": "同时控制查询和自动通知图片后附带的 codex-reset.com 与 Tibo 推特公告链接。关闭后只发送图片，图片内来源署名仍保留。文字模式或渲染失败回退文字时仍保留原有来源。保存后重载插件。"
+  },
+  "query_output": {
+    "description": "查询输出方式",
+    "type": "string",
+    "default": "image",
+    "options": ["image", "text"],
+    "hint": "image = 图片卡片（默认），text = 文字。使用 AstrBot 配置的 HTML 文转图服务；渲染失败自动返回完整文字。保存后重载。"
+  },
+  "notification_output": {
+    "description": "自动通知输出方式",
+    "type": "string",
+    "default": "image",
+    "options": ["image", "text"],
+    "hint": "image = 精简图片卡片（默认），text = 文字。区分额度直接重置、重置卡发放和重置预告；渲染失败自动回退文字。保存后重载。"
+  },
   "enabled": {
     "description": "启用自动通知",
     "type": "bool",

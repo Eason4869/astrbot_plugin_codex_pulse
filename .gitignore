@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# AstrBot state created while importing the framework in standalone tests.
+data/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

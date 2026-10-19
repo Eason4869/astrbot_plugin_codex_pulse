@@ -1,6 +1,6 @@
 name: astrbot_plugin_codex_reset
 display_name: Codex 重置通知
-desc: 追踪 codex-reset.com 公共额度重置，支持 Tibo 重置预告、WebUI 群黑白名单通知、上次重置查询及下次重置预测。
-version: v1.2.1
+desc: 图片卡片查询与群通知，区分额度直接重置、重置卡发放和重置预告，支持黑白名单与渲染失败文字回退。
+version: v1.3.0
 author: Glmg
 repo: https://github.com/Koishi0425/astrbot_plugin_codex_reset

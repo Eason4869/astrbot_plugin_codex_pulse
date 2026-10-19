@@ -1,10 +1,10 @@
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from data.plugins.astrbot_plugin_codex_reset import forecast as forecast_module
 from data.plugins.astrbot_plugin_codex_reset.forecast import Forecast
 from data.plugins.astrbot_plugin_codex_reset.main import CodexResetPlugin
@@ -64,6 +64,8 @@ def plugin():
     instance.known_groups = {GROUP}
     instance.delivery_cursors = {GROUP: "2026-09-12T08:09:17+00:00"}
     instance.put_kv_data = AsyncMock()
+    # Existing receipt tests also exercise the unavailable-renderer fallback.
+    instance.html_render = AsyncMock(side_effect=RuntimeError("renderer offline"))
     return instance
 
 
@@ -264,3 +266,212 @@ async def test_later_promise_is_delivered(plugin, payload):
     payload["latest_alert"]["source_at"] = "2026-09-22T06:00:00Z"
     await plugin.notify_groups(Forecast.from_payload(payload))
     assert plugin.context.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_notification_uses_image_and_clickable_source(plugin, payload):
+    from astrbot.api.message_components import Image, Plain
+
+    plugin.html_render = AsyncMock(return_value="https://example.com/notice.png")
+    await plugin.notify_groups(Forecast.from_payload(payload))
+    chain = plugin.context.send_message.await_args.args[1].chain
+    assert any(isinstance(item, Image) for item in chain)
+    assert any(
+        isinstance(item, Plain) and "https://codex-reset.com/" in item.text
+        for item in chain
+    )
+    assert plugin.alert_cursors[GROUP] == payload["alert_event_id"]
+
+
+@pytest.mark.asyncio
+async def test_two_groups_share_one_notice_render(plugin, payload):
+    plugin.html_render = AsyncMock(return_value="https://example.com/notice.png")
+    plugin.config["group_ids"].append(OTHER)
+    plugin.delivery_cursors[OTHER] = plugin.delivery_cursors[GROUP]
+    await plugin.notify_groups(Forecast.from_payload(payload))
+    assert plugin.html_render.await_count == 1
+    assert plugin.context.send_message.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "action", ["状态", "上次", "预测", "status", "last", "forecast"]
+)
+@pytest.mark.asyncio
+async def test_query_is_image_by_default(plugin, payload, action):
+    from astrbot.api.event import MessageEventResult
+    from astrbot.api.message_components import Image
+
+    plugin.html_render = AsyncMock(return_value="https://example.com/query.png")
+    plugin.fetch_forecast = AsyncMock(return_value=Forecast.from_payload(payload))
+    plugin.fetch_banked = AsyncMock(return_value=None)
+    event = SimpleNamespace(
+        get_group_id=lambda: "123",
+        get_platform_id=lambda: "bot",
+        chain_result=lambda chain: MessageEventResult(chain),
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event, action)]
+    assert len(results) == 1
+    assert any(isinstance(item, Image) for item in results[0].chain)
+    assert results[0].use_t2i_ is False
+
+
+@pytest.mark.asyncio
+async def test_query_render_failure_retains_full_text(plugin, payload):
+    from astrbot.api.event import MessageEventResult
+
+    plugin.fetch_forecast = AsyncMock(return_value=Forecast.from_payload(payload))
+    plugin.fetch_banked = AsyncMock(return_value=None)
+    event = SimpleNamespace(
+        get_group_id=lambda: "123",
+        get_platform_id=lambda: "bot",
+        chain_result=lambda chain: MessageEventResult(chain),
+        plain_result=lambda text: MessageEventResult().message(text),
+    )
+    results = [result async for result in plugin.codex(event)]
+    text = results[0].chain[0].text
+    assert "24 小时内重置概率：20%" in text
+    assert "本群通知：已启用" in text
+    assert results[0].use_t2i_ is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_text_mode_skips_renderer(plugin, payload):
+    plugin.config["notification_output"] = "text"
+    plugin.html_render = AsyncMock(return_value="https://example.com/notice.png")
+    await plugin.notify_groups(Forecast.from_payload(payload))
+    plugin.html_render.assert_not_awaited()
+    assert plugin.context.send_message.await_args.args[1].chain[0].text
+
+
+@pytest.mark.asyncio
+async def test_banked_notice_does_not_advance_direct_reset_receipt(plugin, payload):
+    from datetime import timedelta
+
+    from data.plugins.astrbot_plugin_codex_reset.banked import BankedSnapshot
+
+    plugin.html_render = AsyncMock(return_value="https://example.com/ticket.png")
+    payload["latest_alert"] = None
+    # Banked module uses real time; use a fresh publication and recent event.
+    now = datetime.now(timezone.utc)
+
+    def ticket(at, id):
+        return BankedSnapshot.from_payload(
+            {
+                "updated_at": now.isoformat(),
+                "events": [
+                    {
+                        "id": id,
+                        "type": "credits",
+                        "group": "credits",
+                        "banked_state": "available",
+                        "announced_at": at.isoformat(),
+                    }
+                ],
+            }
+        )
+
+    baseline = ticket(now - timedelta(days=1), "old")
+    latest = ticket(now - timedelta(minutes=1), "new")
+    direct_before = dict(plugin.delivery_cursors)
+    await plugin.notify_groups(Forecast.from_payload(payload), banked=baseline)
+    plugin.context.send_message.assert_not_awaited()
+    await plugin.notify_groups(Forecast.from_payload(payload), banked=latest)
+    await plugin.notify_groups(Forecast.from_payload(payload), banked=latest)
+    plugin.context.send_message.assert_awaited_once()
+    assert plugin.delivery_cursors == direct_before
+    assert plugin.banked_cursors[GROUP]["id"] == "new"
+    assert "直接恢复额度" in plugin.html_render.await_args.args[1]["card"]["note"]
+
+
+@pytest.mark.asyncio
+async def test_reload_preserves_banked_receipt(plugin):
+    receipt = {"id": "ticket:1", "at": NOW.isoformat(), "state": "available"}
+    plugin.get_kv_data = AsyncMock(
+        return_value={
+            "known_groups": [GROUP],
+            "cursors": dict(plugin.delivery_cursors),
+            "alerts": {},
+            "banked": {GROUP: receipt},
+        }
+    )
+    plugin.config["enabled"] = False
+    await plugin.initialize()
+    try:
+        assert plugin.banked_cursors == {GROUP: receipt}
+        await plugin.save_delivery_state()
+        assert plugin.put_kv_data.await_args.args[1]["banked"] == {GROUP: receipt}
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_ticket_notifies_when_forecast_is_unavailable(plugin, monkeypatch):
+    from data.plugins.astrbot_plugin_codex_reset import main as main_module
+    from data.plugins.astrbot_plugin_codex_reset.banked import BankedSnapshot
+
+    now = datetime.now(timezone.utc)
+    banked = BankedSnapshot.from_payload(
+        {
+            "updated_at": now.isoformat(),
+            "events": [
+                {
+                    "id": "ticket:new",
+                    "group": "credits",
+                    "type": "credits",
+                    "banked_state": "available",
+                    "announced_at": (now - timedelta(minutes=1)).isoformat(),
+                }
+            ],
+        }
+    )
+    plugin.banked_cursors[GROUP] = {
+        "id": "ticket:old",
+        "state": "available",
+        "at": (now - timedelta(days=1)).isoformat(),
+    }
+    plugin.html_render = AsyncMock(return_value="https://example.com/ticket.png")
+    plugin.refresh_groups = AsyncMock()
+    plugin.fetch_forecast = AsyncMock(side_effect=RuntimeError("forecast offline"))
+    plugin.fetch_banked = AsyncMock(return_value=banked)
+    monkeypatch.setattr(
+        main_module.asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await plugin.poll()
+    plugin.context.send_message.assert_awaited_once()
+    assert plugin.banked_cursors[GROUP]["id"] == "ticket:new"
+    assert plugin.delivery_cursors[GROUP] == "2026-09-12T08:09:17+00:00"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.asyncio
+async def test_source_link_switch_controls_both_site_and_tibo(plugin, payload, enabled):
+    from astrbot.api.message_components import Image, Plain
+    from data.plugins.astrbot_plugin_codex_reset.presentation import build_card
+
+    plugin.config["send_source_links"] = enabled
+    plugin.html_render = AsyncMock(return_value="https://example.com/card.png")
+    card = build_card(
+        Forecast.from_payload(payload), timezone.utc, "watch", notification=True
+    )
+    chain = await plugin.card_message(card, "fallback")
+    assert any(isinstance(item, Image) for item in chain.chain)
+    texts = [item.text for item in chain.chain if isinstance(item, Plain)]
+    if enabled:
+        assert "https://codex-reset.com/" in "\n".join(texts)
+        assert payload["latest_alert"]["url"] in "\n".join(texts)
+    else:
+        assert texts == []
+
+
+@pytest.mark.asyncio
+async def test_link_switch_does_not_strip_fallback_sources(plugin, payload):
+    from data.plugins.astrbot_plugin_codex_reset.presentation import build_card
+
+    plugin.config["send_source_links"] = False
+    f = Forecast.from_payload(payload)
+    message = await plugin.card_message(
+        build_card(f, timezone.utc), f.render(timezone.utc)
+    )
+    assert "https://codex-reset.com/" in message.chain[0].text

@@ -3,15 +3,15 @@
 import asyncio
 import html
 import json
-import logging
 from collections import OrderedDict
 from pathlib import Path
 from time import monotonic
 from urllib.parse import urlsplit
 
+from astrbot.api import logger
+
 RENDER_TIMEOUT = 12
 ROOT = Path(__file__).parent
-logger = logging.getLogger(__name__)
 
 
 def escape_data(value):

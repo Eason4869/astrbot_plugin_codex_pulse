@@ -1,6 +1,6 @@
 name: astrbot_plugin_codex_pulse
 display_name: Codex Pulse｜重置脉搏
 desc: 精美卡片追踪 Codex 直接重置、重置卡发放与预告，支持分类群通知、管理员测试卡片和文字回退。
-version: v1.0.0
+version: v1.0.1
 author: Eason4869
 repo: https://github.com/Eason4869/astrbot_plugin_codex_pulse

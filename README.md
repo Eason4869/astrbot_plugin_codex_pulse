@@ -4,7 +4,7 @@
 
 <p align="center">把公共额度重置、重置卡发放与重置预告，变成一眼读懂的通知卡片。</p>
 
-<p align="center">AstrBot 插件 · v1.0.0 · AGPL-3.0</p>
+<p align="center">AstrBot 插件 · v1.0.1 · AGPL-3.0</p>
 
 ![三类通知卡片，示例数据](assets/preview-notifications.png)
 
